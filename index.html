@@ -26335,11 +26335,20 @@ ${tonePrompt}
         //  语音采集 · 统一能力检测 / 麦克风申请 / 编码选择
         //  ------------------------------------------------------------
         //  iOS 的坑集中在这几处，三处录音入口（聊天 / 通话 / 录音机）必须共用这一套：
-        //   1) iOS 全系没有 webkitSpeechRecognition —— 浏览器识别一定是空的，只能走云端 ASR
+        //   1) iOS 上的 webkitSpeechRecognition 只是个壳（报 not-allowed 或抢麦克风轨道），
+        //      全站只在非 iOS 启动它，iOS 一律走云端 ASR
         //   2) iOS 的 MediaRecorder 只有 audio/mp4（AAC），没有 webm/opus
         //   3) 权限点过「不允许」后 getUserMedia 直接 reject 且不再弹窗，必须给出恢复路径
         //   4) http:// 下 navigator.mediaDevices 直接是 undefined
         // ============================================================
+        // 统一的 iOS 判定：UA 之外还要认「伪装成 Mac 的 iPad」。
+        // 识别开关、容器选择、自检文案必须都走这一份，否则会出现"这里禁了、那里又偷偷开"的割裂。
+        function isIOSDevice() {
+            const ua = navigator.userAgent || '';
+            return /iPad|iPhone|iPod/.test(ua) ||
+                (navigator.platform === 'MacIntel' && (navigator.maxTouchPoints || 0) > 1);
+        }
+
         function audioCaptureSupport() {
             return {
                 secure: !!window.isSecureContext,
@@ -26355,6 +26364,7 @@ ${tonePrompt}
             denied: '麦克风权限被拒绝。iPhone 请到：设置 → Safari 浏览器 → 麦克风 → 选择「允许」；或清除本网站数据后刷新重试。',
             'no-device': '没有检测到麦克风。',
             busy: '麦克风被其它 App 占用，关掉正在录音的 App 再试。',
+            pending: '上一次麦克风申请还没结束，稍等一下再按住。',
             unknown: '麦克风打开失败，请重试。'
         };
 
@@ -26369,32 +26379,51 @@ ${tonePrompt}
             if (!cap.secure) return { ok: false, code: 'insecure' };
             if (!cap.hasGUM || !cap.hasRec) return { ok: false, code: 'unsupported' };
 
-            if (micPending) return { ok: false, code: 'busy' };
+            if (micPending) return { ok: false, code: 'pending' };
             micPending = true;
 
+            // 两轮申请，参数从「带约束」降到「和自检一模一样」：
+            //   iOS 上带 echoCancellation / noiseSuppression 的申请偶发直接 reject
+            //   （TypeError / NotSupportedError / InvalidStateError），而自检里的 {audio:true}
+            //   却能过 —— 这正是「自检通过、按住说话却提示麦克风打开失败」最常见的成因。
+            //   第二轮前的 250ms 是给硬件放行：上一轮失败可能刚释放麦克风，系统还没切回来。
+            const tries = [
+                { audio: { echoCancellation: !forCall, noiseSuppression: true, autoGainControl: true } },
+                { audio: true }
+            ];
+            let lastErr = null;
+            let lastName = '';
             try {
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    audio: forCall
-                        ? { echoCancellation: false, noiseSuppression: true, autoGainControl: true }
-                        : { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-                });
-                return { ok: true, stream: stream };
-            } catch (e) {
-                const n = (e && e.name) || '';
-                console.warn('[mic] getUserMedia 失败：', n, e && e.message);
-                if (n === 'NotAllowedError' || n === 'SecurityError' || n === 'PermissionDeniedError') {
-                    return { ok: false, code: 'denied', error: e };
+                for (let i = 0; i < tries.length; i++) {
+                    if (i > 0) await new Promise(r => setTimeout(r, 250));
+                    try {
+                        const stream = await navigator.mediaDevices.getUserMedia(tries[i]);
+                        if (!stream || !stream.active) throw new Error('stream inactive');
+                        return { ok: true, stream: stream };
+                    } catch (e) {
+                        lastErr = e;
+                        lastName = (e && e.name) || '';
+                        console.warn('[mic] getUserMedia 第' + (i + 1) + '轮失败：', lastName, e && e.message);
+                        // 权限被拒是确定性的，重试没有意义：直接定案，别让用户白等一轮
+                        if (lastName === 'NotAllowedError' || lastName === 'SecurityError' ||
+                            lastName === 'PermissionDeniedError') break;
+                    }
                 }
-                if (n === 'NotFoundError' || n === 'DevicesNotFoundError' || n === 'OverconstrainedError') {
-                    return { ok: false, code: 'no-device', error: e };
-                }
-                if (n === 'NotReadableError' || n === 'TrackStartError' || n === 'AbortError') {
-                    return { ok: false, code: 'busy', error: e };
-                }
-                return { ok: false, code: 'unknown', error: e };
             } finally {
                 micPending = false;
             }
+
+            if (lastName === 'NotAllowedError' || lastName === 'SecurityError' || lastName === 'PermissionDeniedError') {
+                return { ok: false, code: 'denied', error: lastErr, name: lastName };
+            }
+            if (lastName === 'NotFoundError' || lastName === 'DevicesNotFoundError' || lastName === 'OverconstrainedError') {
+                return { ok: false, code: 'no-device', error: lastErr, name: lastName };
+            }
+            if (lastName === 'NotReadableError' || lastName === 'TrackStartError' || lastName === 'AbortError') {
+                return { ok: false, code: 'busy', error: lastErr, name: lastName };
+            }
+            // 叫不出名字的失败：把真实 name 一起带回去，下次一眼就能定位（以前这里被吞成"未知"）
+            return { ok: false, code: 'unknown', error: lastErr, name: lastName || (lastErr && lastErr.message) || 'unknown' };
         }
 
         // iOS 优先 mp4，桌面优先 webm；都探测不到就返回 ''，交给浏览器默认
@@ -26402,9 +26431,7 @@ ${tonePrompt}
             if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) return '';
             // iOS 只认 mp4/aac；桌面优先 webm/opus（体积小、云端 ASR 兼容性最好）。
             // 不能无脑把 audio/mp4 放第一位：新版 Chrome 也支持 mp4，会把桌面录音一起切过去。
-            const ua = navigator.userAgent || '';
-            const isIOS = /iPad|iPhone|iPod/.test(ua) ||
-                (navigator.platform === 'MacIntel' && (navigator.maxTouchPoints || 0) > 1);
+            const isIOS = isIOSDevice();
             const cands = isIOS
                 ? ['audio/mp4', 'audio/mp4;codecs=mp4a.40.2', 'audio/aac', 'audio/webm;codecs=opus', 'audio/webm']
                 : ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
@@ -26446,7 +26473,7 @@ ${tonePrompt}
         // 「权限被拒」不能只用 toast：用户不知道去哪儿改。这里给可照做的路径。
         // iOS 上有两层权限（系统级 / 站点级），玩家通常只开了一层；站点级被拒过就不再弹框，
         // 表现和"没开权限"一模一样 —— 所以两种容器、两层权限都要写清楚。
-        function notifyMicError(code) {
+        function notifyMicError(code, detail) {
             if (code === 'insecure') {
                 showModal(`
                     <div class="modal-title">需要 HTTPS 才能用麦克风</div>
@@ -26501,6 +26528,12 @@ ${tonePrompt}
                 return;
             }
 
+            // 未知失败：把真实的 error.name 带出来（例如 TypeError / InvalidStateError）。
+            // 只写"请重试"等于什么都没说，玩家和开发者都无从下手。
+            if (code === 'unknown' && detail) {
+                toast('麦克风打开失败（' + detail + '），请重试。', 3600);
+                return;
+            }
             toast(MIC_ERROR_TEXT[code] || MIC_ERROR_TEXT.unknown, 3600);
         }
 
@@ -26564,7 +26597,7 @@ ${tonePrompt}
 
             // 统一入口：能力检测 + 结构化失败码（HTTPS / 权限 / 占用 / 无设备）
             const mic = await acquireMic();
-            if (!mic.ok) { notifyMicError(mic.code); return; }
+            if (!mic.ok) { notifyMicError(mic.code, mic.name); return; }
             const stream = mic.stream;
 
             // 用户可能在授权期间已松手
@@ -26606,9 +26639,12 @@ ${tonePrompt}
                 return;
             }
 
-            // 【隔离】实时语音识别（浏览器支持时）单独一个 try-catch：它是锦上添花，
-            // 云端 ASR 是另一条独立请求，识别怎么挂都不能反过来影响上面已经跑起来的录音器。
-            const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+            // 【隔离】实时语音识别单独一个 try-catch：它是锦上添花，云端 ASR 是另一条独立请求，
+            // 识别怎么挂都不能反过来影响上面已经跑起来的录音器。
+            // 【iOS 上直接不启动】iOS Safari 的 webkitSpeechRecognition 只是个壳：要么立刻抛
+            // "not-allowed"，要么把麦克风轨道抢过去，让紧随其后的录音直接哑掉。本站已有云端 ASR
+            // （自检里的「ASR 连通性」就是它），iOS 完全不需要它 —— 判空不如根本不启动。
+            const SR = isIOSDevice() ? null : (window.SpeechRecognition || window.webkitSpeechRecognition);
             if (SR) {
                 try {
                     const r = new SR();
@@ -27230,7 +27266,7 @@ ${tonePrompt}
         async function startRecorder() {
             if (recState.active) return;
             const mic = await acquireMic();
-            if (!mic.ok) { notifyMicError(mic.code); return; }
+            if (!mic.ok) { notifyMicError(mic.code, mic.name); return; }
             const stream = mic.stream;
             let recorder;
             const mime = pickRecorderMime();
@@ -29234,8 +29270,10 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
                     cap.hasRec ? '可用' : '当前浏览器不支持录音'),
                 vscRow('可用 mimeType', mime ? 'ok' : 'warn',
                     mime ? mime : '探测不到，将使用浏览器默认容器'),
-                vscRow('浏览器语音识别', cap.hasSR ? 'ok' : 'warn',
-                    cap.hasSR ? '可用（桌面 Chrome / Edge）' : '不支持，将走云端 ASR（iOS 属正常）'),
+                vscRow('浏览器语音识别', (!cap.hasSR || isIOSDevice()) ? 'warn' : 'ok',
+                    isIOSDevice()
+                        ? 'iOS 上已强制关闭（会抢麦克风轨道），统一走云端 ASR'
+                        : (cap.hasSR ? '可用（桌面 Chrome / Edge）' : '不支持，将走云端 ASR')),
                 vscRow('MiniMax Key', v0.mmKey ? 'ok' : 'bad',
                     v0.mmKey ? '已配置（' + v0.mmKey.slice(0, 4) + '…' + v0.mmKey.slice(-4) + '）' : '去「录音机 · 语音服务」填'),
                 vscRow('ASR 模型', v0.mmAsrModel ? 'ok' : 'bad',
@@ -31648,7 +31686,9 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
 
             if (callState.muted) stream.getAudioTracks().forEach(t => { t.enabled = false; });
 
-            const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+            // 和聊天录音同一把锁：iOS 上不启动浏览器识别（只是个壳 + 会抢麦），
+            // 通话里的转写全部交给松手后的云端 ASR。
+            const SR = isIOSDevice() ? null : (window.SpeechRecognition || window.webkitSpeechRecognition);
             if (SR) {
                 try {
                     const r = new SR();
