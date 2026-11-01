@@ -26373,6 +26373,37 @@ ${tonePrompt}
         //   表现为对方说话突然很小声甚至听不见 —— 通话场景宁可轻微啸叫，也要保证通话音量。
         let micPending = false;   // 只保护"申请过程中"
 
+        // 让出音频会话：iOS 上 running 的 AudioContext（底层是常驻的 RemoteIO 输出单元）
+        // 会一直占着音频通道，此时再申请麦克风，WebKit 可能直接拒绝，而且错误名不落在具体分类里
+        // —— 表现就是"自检能过、通话里按住说话却说麦克风打开失败"。
+        // 挂起它、留一拍让系统真正放开通道，再申请。
+        // 外面包一层 try：_mmAudioCtx 声明在本函数之后（暂时性死区），异常时退化成"不让位"即可。
+        function suspendPlaybackForMic() {
+            try {
+                const ctx = _mmAudioCtx;
+                if (!ctx || ctx.state !== 'running') return null;
+                try {
+                    const pr = ctx.suspend();
+                    if (pr && pr.catch) pr.catch(() => {});
+                } catch (e) {}
+                return ctx;
+            } catch (e) { return null; }
+        }
+
+        // 拿到流（或彻底失败）之后必须把输出还回去：不 resume 的后果比"抢麦"更严重 ——
+        // 之后所有 TTS 都是哑的。晚 60ms 再 resume，避免刚建立的采集单元被打断。
+        function resumePlaybackAfterMic(ctx) {
+            if (!ctx) return;
+            setTimeout(() => {
+                try {
+                    if (ctx.state === 'suspended') {
+                        const pr = ctx.resume();
+                        if (pr && pr.catch) pr.catch(() => {});
+                    }
+                } catch (e) {}
+            }, 60);
+        }
+
         async function acquireMic(opts) {
             const forCall = !!(opts && opts.forCall);
             const cap = audioCaptureSupport();
@@ -26382,22 +26413,27 @@ ${tonePrompt}
             if (micPending) return { ok: false, code: 'pending' };
             micPending = true;
 
-            // 两轮申请，参数从「带约束」降到「和自检一模一样」：
-            //   iOS 上带 echoCancellation / noiseSuppression 的申请偶发直接 reject
-            //   （TypeError / NotSupportedError / InvalidStateError），而自检里的 {audio:true}
-            //   却能过 —— 这正是「自检通过、按住说话却提示麦克风打开失败」最常见的成因。
-            //   第二轮前的 250ms 是给硬件放行：上一轮失败可能刚释放麦克风，系统还没切回来。
+            // 两轮申请：① 带约束（原样） ② 先挂起 AudioContext 让出通道，再用最裸的 {audio:true}。
+            // 通话场景（forCall）在第一轮之前就先让位 —— 通话中 ctx 必然 running（保活节点在跑），
+            // 不让位的话第一轮基本白给，还会多消耗一次权限交互。
+            // 第二轮前的 250ms 是给硬件放行：上一轮失败可能刚释放麦克风，系统还没切回来。
             const tries = [
-                { audio: { echoCancellation: !forCall, noiseSuppression: true, autoGainControl: true } },
-                { audio: true }
+                { audio: { echoCancellation: !forCall, noiseSuppression: true, autoGainControl: true }, yield: forCall },
+                { audio: true, yield: true }
             ];
             let lastErr = null;
             let lastName = '';
+            let suspendedCtx = null;
             try {
                 for (let i = 0; i < tries.length; i++) {
+                    const t = tries[i];
                     if (i > 0) await new Promise(r => setTimeout(r, 250));
+                    if (t.yield && !suspendedCtx) {
+                        suspendedCtx = suspendPlaybackForMic();
+                        if (suspendedCtx) await new Promise(r => setTimeout(r, 150));
+                    }
                     try {
-                        const stream = await navigator.mediaDevices.getUserMedia(tries[i]);
+                        const stream = await navigator.mediaDevices.getUserMedia({ audio: t.audio });
                         if (!stream || !stream.active) throw new Error('stream inactive');
                         return { ok: true, stream: stream };
                     } catch (e) {
@@ -26411,6 +26447,7 @@ ${tonePrompt}
                 }
             } finally {
                 micPending = false;
+                resumePlaybackAfterMic(suspendedCtx);
             }
 
             if (lastName === 'NotAllowedError' || lastName === 'SecurityError' || lastName === 'PermissionDeniedError') {
@@ -31638,10 +31675,12 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
                 resetCallTalkBtn();
                 const tipEl = document.getElementById('wxCallTip');
                 if (tipEl) tipEl.textContent = MIC_ERROR_TEXT[mic.code] || MIC_ERROR_TEXT.unknown;
+                // 把真实错误名一起摊开：只写"请重试"等于什么都没说，复现一次也定不了位
                 const text = await askCallText(
                     (mic.code === 'denied'
                         ? '麦克风权限被拒绝：iPhone 请到「设置 → Safari 浏览器 → 麦克风」允许本网站后刷新。'
                         : (MIC_ERROR_TEXT[mic.code] || MIC_ERROR_TEXT.unknown)) +
+                    (mic.name ? '\n（错误码: ' + mic.name + '）' : '') +
                     '\n也可以直接在这里打字。'
                 );
                 if (text) sendCallText(text);
