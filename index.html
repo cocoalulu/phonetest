@@ -26419,6 +26419,101 @@ ${tonePrompt}
             return suspendPlaybackForMic();
         }
 
+        // ===== 录音期的音频会话（Safari 16.4+ 的 navigator.audioSession）=====
+        // 这是「通话里按住说话必失败、聊天里却正常」的真正根因，也是真机截图里那个
+        // InvalidStateError 的来源：
+        //   通话入口 unlockIOSAudio() 为了"静音键不哑"把 audioSession.type 设成了 'playback'。
+        //   而 iOS 的 AVAudioSessionCategoryPlayback 是**没有输入**的类别，WebKit 又把
+        //   作者显式设置的 type 当成硬约束，于是 getUserMedia 永远拿不到 record 类别，
+        //   直接以 InvalidStateError 拒绝。
+        //   所以它不是"设备被占用"——停保活、suspend ctx、换裸参数全都无效（这三条都已做过，
+        //   错误码依旧是 InvalidStateError），只有把会话类型切回 'play-and-record' 才行。
+        // 自检能过正是因为自检发生在 unlockIOSAudio 之前，type 还是默认的 'auto'。
+        let _recSessionOn = false;     // 是否处于"为录音让路"的会话态
+        let _recSessionPrev = null;    // 让路之前是什么，用来还原
+        let _recSessionTimer = null;   // 看门狗：漏掉某个出口时不至于让会话永久停在只录不放
+
+        function beginRecSession() {
+            if (_recSessionOn) return true;
+            const nav = navigator;
+            if (!nav || !nav.audioSession) return false;   // 老 Safari / 微信容器：没这个 API，跳过
+            try {
+                _recSessionPrev = nav.audioSession.type || 'auto';
+                if (_recSessionPrev === 'play-and-record') {
+                    // 还原点和目标相同等于没得还原：记成 null，让 endRecSession 按通话状态自己定
+                    _recSessionPrev = null;
+                    _recSessionOn = true;
+                    armRecSessionWatchdog();
+                    return true;
+                }
+                nav.audioSession.type = 'play-and-record';
+                // 读回校验：Safari 对不认识的取值可能静默忽略。不校验的话我们会以为"改了"，
+                // 真机上却还是老的 playback —— 又一轮无从下手的排查。
+                if (nav.audioSession.type !== 'play-and-record') {
+                    console.warn('[mic] audioSession.type 未生效，当前仍是 ' + nav.audioSession.type);
+                    _recSessionPrev = null;
+                    return false;
+                }
+                _recSessionOn = true;
+                armRecSessionWatchdog();
+                return true;
+            } catch (e) {
+                // 极老的实现可能不认这个值：保持原样，靠 hardReleaseAudio 兜底
+                console.warn('[mic] audioSession 切 play-and-record 失败：', e && e.message);
+                _recSessionPrev = null;
+                return false;
+            }
+        }
+
+        // 按住说话最长也就几十秒。真有出口漏了 endRecSession（异常、页面被打断），
+        // 会话会一直停在 play-and-record —— 输出走听筒、音量极小，用户只会觉得"声音变小了"。
+        // 与其靠人去查所有出口，不如让它自己恢复。
+        function armRecSessionWatchdog() {
+            clearTimeout(_recSessionTimer);
+            _recSessionTimer = setTimeout(() => {
+                if (!_recSessionOn) return;
+                console.warn('[mic] 录音会话超时未收尾，自动还原');
+                endRecSession();
+            }, 90000);
+        }
+
+        // 幂等：任何一个出口都可以随手调，不会把会话状态搅乱
+        function endRecSession() {
+            if (!_recSessionOn) return;
+            _recSessionOn = false;
+            clearTimeout(_recSessionTimer);
+            _recSessionTimer = null;
+            const prev = _recSessionPrev;
+            _recSessionPrev = null;
+            try {
+                const nav = navigator;
+                if (!nav || !nav.audioSession) return;
+                const inCall = !!(callState && callState.active && callState.phase === 'active');
+                // prev 若是 'play-and-record'（上一轮脏值）就不能拿来还原，否则永远回不到播放态
+                const clean = (prev && prev !== 'play-and-record') ? prev : null;
+                nav.audioSession.type = inCall ? 'playback' : (clean || 'auto');
+            } catch (e) {}
+        }
+
+        // 最后兜底：把整条音频会话硬销毁（不是 suspend），供 InvalidStateError 时重试用。
+        // suspend 只是暂停渲染，ctx 对象仍注册在会话上；close 才会真正释放输出单元。
+        async function hardReleaseAudio() {
+            try { stopBlobAudio(); } catch (e) {}
+            try { stopCallKeepAlive(); } catch (e) {}
+            try {
+                const els = document.querySelectorAll('audio,video');
+                for (let i = 0; i < els.length; i++) { try { els[i].pause(); } catch (e) {} }
+            } catch (e) {}
+            let ctx = null;
+            try { ctx = _mmAudioCtx; } catch (e) { ctx = null; }
+            if (ctx && ctx.state !== 'closed') {
+                try { const p = ctx.close(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+            }
+            try { _mmAudioCtx = null; } catch (e) {}     // 下次 getCallAudioCtx 会重建
+            try { _vcAudioSrc = null; } catch (e) {}     // 旧节点随旧 ctx 一起作废
+            await new Promise(r => setTimeout(r, 120));
+        }
+
         async function acquireMic(opts) {
             const forCall = !!(opts && opts.forCall);
             const cap = audioCaptureSupport();
@@ -26428,12 +26523,16 @@ ${tonePrompt}
             if (micPending) return { ok: false, code: 'pending' };
             micPending = true;
 
-            // ① 先把输出通道彻底让出去（停播放 + 停保活 + 挂起 ctx），再申请。见 yieldAudioForMic。
+            // ① 会话类型先切到"可录音"。这一步是 301 病房的根因修复：
+            //    通话入口把 type 锁成了 'playback'，不切回来，后面所有申请都注定失败。
+            beginRecSession();
+
+            // ② 再把输出通道彻底让出去（停播放 + 停保活 + 挂起 ctx）。见 yieldAudioForMic。
             //    只有真的挂起了才等 150ms：聊天常态下 ctx 本来就没在跑，不该平白多这 150ms 延迟。
             const suspendedCtx = yieldAudioForMic();
             if (suspendedCtx) await new Promise(r => setTimeout(r, 150));
 
-            // ② 两轮申请。裸参数 {audio:true} 在 iOS 上最不容易被拒，而且对聊天来说它**等价于**
+            // ③ 两轮申请。裸参数 {audio:true} 在 iOS 上最不容易被拒，而且对聊天来说它**等价于**
             //    默认约束（echoCancellation / noiseSuppression / autoGainControl 规范默认就是 true），
             //    所以聊天把裸参数提到第一位没有任何音质代价。
             //    通话相反：echoCancellation:false 是刻意要的（避免 AEC 把对方音量压死），
@@ -26447,7 +26546,15 @@ ${tonePrompt}
             let gotStream = false;
             try {
                 for (let i = 0; i < tries.length; i++) {
-                    if (i > 0) await new Promise(r => setTimeout(r, 250));
+                    if (i > 0) {
+                        await new Promise(r => setTimeout(r, 250));
+                        // 首轮是 InvalidStateError：说明内核层面仍认为"本会话不可输入"。
+                        // 此时光 suspend 不够（ctx 依旧挂在会话上），整条会话硬销毁再试。
+                        if (lastName === 'InvalidStateError') {
+                            console.warn('[mic] InvalidStateError：硬释放音频会话后重试');
+                            await hardReleaseAudio();
+                        }
+                    }
                     try {
                         const stream = await navigator.mediaDevices.getUserMedia(tries[i]);
                         if (!stream || !stream.active) throw new Error('stream inactive');
@@ -26465,6 +26572,14 @@ ${tonePrompt}
             } finally {
                 micPending = false;
                 resumePlaybackAfterMic(suspendedCtx, !gotStream);
+                // 失败就立刻把会话还回去，别让页面停在"只录不放"的类别里
+                if (!gotStream) {
+                    endRecSession();
+                    // 首轮 InvalidStateError 触发的 hardReleaseAudio 会把 _mmAudioCtx 置空。
+                    // 若第二轮也没成，这里必须补建一个：否则从"麦克风失败"到"下一句 TTS"
+                    // 之间是一个没有播放上下文的空窗，对方说话会直接哑掉。
+                    try { if (_mmAudioCtx === null) getCallAudioCtx(); } catch (e) {}
+                }
             }
 
             if (lastName === 'NotAllowedError' || lastName === 'SecurityError' || lastName === 'PermissionDeniedError') {
@@ -26620,6 +26735,9 @@ ${tonePrompt}
             voiceRec.timer = null;
             voiceRec.cancel = false;
             voiceRec.actualMime = '';
+            // 录音态结束：把音频会话还回去（幂等，没让路时是空操作）。
+            // 放这里是因为聊天录音的所有出口最终都会走到 resetVoiceRec。
+            endRecSession();
             // 注意：pressing / startY 不在这里清，它们由 pointerdown / pointerup 管理
         }
 
@@ -29565,7 +29683,11 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
         function setPlaybackAudioSession() {
             try {
                 const nav = navigator;
-                if (nav.audioSession) nav.audioSession.type = 'playback';
+                if (!nav.audioSession) return;
+                // 录音让路期间绝不能设成 'playback'：那会把输入通道当场锁死，
+                // 下一次按住说话就是 InvalidStateError（见 beginRecSession 的注释）。
+                // 通话中途很会调这个函数（接听、回前台、放完 TTS），所以拦在这里最保险。
+                nav.audioSession.type = (_recSessionOn ? 'play-and-record' : 'playback');
             } catch (e) {}
         }
 
@@ -31612,6 +31734,7 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
             callState.startedAt = Date.now();
             // 开场白有声的前置条件：麦克风先让出来，再把输出通道拨回 media。
             // 顺序不能反 —— track 还活着时切 playback，系统会立刻改回 playAndRecord。
+            endRecSession();   // 上一轮录音若被打断，会话可能还停在 play-and-record
             const micReleased = releaseStaleMic();
             if (micReleased) {
                 setPlaybackAudioSession();
@@ -31712,6 +31835,7 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
             // 授权期间用户可能已松手
             if (!callState.active || !callState.recording) {
                 stream.getTracks().forEach(t => t.stop());
+                endRecSession();
                 // 这次按下作废了，但保活节点在申请前被停掉，得接回来，否则这通电话会一直"没人续命"
                 if (callState.active && callState.phase === 'active') startCallKeepAlive();
                 return;
@@ -31731,6 +31855,7 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
             } catch (e) {
                 console.warn('[call] 录音初始化失败：', (e && e.name) || '', (e && e.message) || '');
                 try { stream.getTracks().forEach(t => t.stop()); } catch (e2) {}
+                endRecSession();
                 callState.stream = null;
                 callState.recorder = null;
                 callState.recording = false;
@@ -31833,6 +31958,7 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
                 // 期间用户挂断 / 取消 / 又开了一段新录音，这次结果作废
                 if (seq !== (callState.recSeq || 0)) return;
                 if (!callState.active || callState.phase !== 'active') {
+                    endRecSession();
                     try { callState.stream && callState.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
                     callState.stream = null;
                     callState.recorder = null;
@@ -31845,6 +31971,10 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
                 }
 
                 try { callState.stream && callState.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+                // 录完了，先把"可录音"的会话态还回去，再切 playback ——
+                // 顺序反了的话 setPlaybackAudioSession 会被 _recSessionOn 拦成 play-and-record，
+                // 输出继续走听筒，对方下一句就又变小声了。
+                endRecSession();
                 // iOS：麦克风释放后音频会话仍可能停在 playAndRecord（输出走听筒、音量极低），
                 // 显式切回 playback 并唤醒 AudioContext，对方下一句才不会「突然变小」。
                 setPlaybackAudioSession();
@@ -31913,6 +32043,8 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
                 if (callState.recorder && callState.recorder.state !== 'inactive') callState.recorder.stop();
             } catch (e) {}
             try { callState.stream && callState.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+            // 先还回可录音的会话态，再切 playback（原因见 finishCallRecord 同名调用）
+            endRecSession();
             // 麦克风松手/取消后把输出通道拨回媒体，别让下一句走听筒
             setPlaybackAudioSession();
             resumeCallAudio();
@@ -32115,6 +32247,8 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
             try { callState.stream && callState.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
             // 挂断时如果刚好在「按住说话」，音频会话还停在 playAndRecord，拨回媒体通道，
             // 否则紧接着回聊天听语音会走听筒、声音很小。
+            // 先摘掉"录音让路"标记，不然下面这句会被 endRecSession 的守卫拦回去。
+            endRecSession();
             setPlaybackAudioSession();
             resumeCallAudio();
 
