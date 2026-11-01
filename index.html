@@ -26392,16 +26392,31 @@ ${tonePrompt}
 
         // 拿到流（或彻底失败）之后必须把输出还回去：不 resume 的后果比"抢麦"更严重 ——
         // 之后所有 TTS 都是哑的。晚 60ms 再 resume，避免刚建立的采集单元被打断。
-        function resumePlaybackAfterMic(ctx) {
-            if (!ctx) return;
+        // failed=true 时连保活节点一起拉回：否则这通电话后半段就再没人维持会话了。
+        function resumePlaybackAfterMic(ctx, failed) {
             setTimeout(() => {
                 try {
-                    if (ctx.state === 'suspended') {
+                    if (ctx && ctx.state === 'suspended') {
                         const pr = ctx.resume();
                         if (pr && pr.catch) pr.catch(() => {});
                     }
                 } catch (e) {}
+                if (!failed) return;   // 成功时保活留给录音结束（finishCallRecord / cancelCallRecord）再拉
+                try {
+                    if (callState && callState.active && callState.phase === 'active') startCallKeepAlive();
+                } catch (e) {}
             }, 60);
+        }
+
+        // 申请麦克风前把输出通道彻底让出去，三步都要做：
+        //   ① 停掉正在播的 TTS / 试听（播放中的节点会一直 hold 住输出单元）
+        //   ② 停掉通话保活节点 —— 它是"永远在播"的循环 buffer，只 suspend 不 stop 的话，
+        //      部分内核仍判定这个会话在播放，从而拒绝麦克风申请
+        //   ③ 挂起 AudioContext，把底层 RemoteIO 输出单元真正释放
+        function yieldAudioForMic() {
+            try { stopBlobAudio(); } catch (e) {}
+            try { stopCallKeepAlive(); } catch (e) {}
+            return suspendPlaybackForMic();
         }
 
         async function acquireMic(opts) {
@@ -26413,28 +26428,30 @@ ${tonePrompt}
             if (micPending) return { ok: false, code: 'pending' };
             micPending = true;
 
-            // 两轮申请：① 带约束（原样） ② 先挂起 AudioContext 让出通道，再用最裸的 {audio:true}。
-            // 通话场景（forCall）在第一轮之前就先让位 —— 通话中 ctx 必然 running（保活节点在跑），
-            // 不让位的话第一轮基本白给，还会多消耗一次权限交互。
-            // 第二轮前的 250ms 是给硬件放行：上一轮失败可能刚释放麦克风，系统还没切回来。
-            const tries = [
-                { audio: { echoCancellation: !forCall, noiseSuppression: true, autoGainControl: true }, yield: forCall },
-                { audio: true, yield: true }
-            ];
+            // ① 先把输出通道彻底让出去（停播放 + 停保活 + 挂起 ctx），再申请。见 yieldAudioForMic。
+            //    只有真的挂起了才等 150ms：聊天常态下 ctx 本来就没在跑，不该平白多这 150ms 延迟。
+            const suspendedCtx = yieldAudioForMic();
+            if (suspendedCtx) await new Promise(r => setTimeout(r, 150));
+
+            // ② 两轮申请。裸参数 {audio:true} 在 iOS 上最不容易被拒，而且对聊天来说它**等价于**
+            //    默认约束（echoCancellation / noiseSuppression / autoGainControl 规范默认就是 true），
+            //    所以聊天把裸参数提到第一位没有任何音质代价。
+            //    通话相反：echoCancellation:false 是刻意要的（避免 AEC 把对方音量压死），
+            //    能带就先带，失败再降到裸参数。
+            //    第二轮前的 250ms 是给硬件放行：上一轮失败可能刚释放麦克风，系统还没切回来。
+            const bare = { audio: true };
+            const tuned = { audio: { echoCancellation: !forCall, noiseSuppression: true, autoGainControl: true } };
+            const tries = forCall ? [tuned, bare] : [bare, tuned];
             let lastErr = null;
             let lastName = '';
-            let suspendedCtx = null;
+            let gotStream = false;
             try {
                 for (let i = 0; i < tries.length; i++) {
-                    const t = tries[i];
                     if (i > 0) await new Promise(r => setTimeout(r, 250));
-                    if (t.yield && !suspendedCtx) {
-                        suspendedCtx = suspendPlaybackForMic();
-                        if (suspendedCtx) await new Promise(r => setTimeout(r, 150));
-                    }
                     try {
-                        const stream = await navigator.mediaDevices.getUserMedia({ audio: t.audio });
+                        const stream = await navigator.mediaDevices.getUserMedia(tries[i]);
                         if (!stream || !stream.active) throw new Error('stream inactive');
+                        gotStream = true;
                         return { ok: true, stream: stream };
                     } catch (e) {
                         lastErr = e;
@@ -26447,7 +26464,7 @@ ${tonePrompt}
                 }
             } finally {
                 micPending = false;
-                resumePlaybackAfterMic(suspendedCtx);
+                resumePlaybackAfterMic(suspendedCtx, !gotStream);
             }
 
             if (lastName === 'NotAllowedError' || lastName === 'SecurityError' || lastName === 'PermissionDeniedError') {
@@ -31695,6 +31712,8 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
             // 授权期间用户可能已松手
             if (!callState.active || !callState.recording) {
                 stream.getTracks().forEach(t => t.stop());
+                // 这次按下作废了，但保活节点在申请前被停掉，得接回来，否则这通电话会一直"没人续命"
+                if (callState.active && callState.phase === 'active') startCallKeepAlive();
                 return;
             }
 
@@ -31716,6 +31735,15 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
                 callState.recorder = null;
                 callState.recording = false;
                 resetCallTalkBtn();
+                // 申请麦克风时输出通道被让出去了（见 yieldAudioForMic），这里必须原路恢复，
+                // 否则录音失败 + 静音叠加，用户会以为整通电话都挂了。
+                try {
+                    if (_mmAudioCtx && _mmAudioCtx.state === 'suspended') {
+                        const pr = _mmAudioCtx.resume();
+                        if (pr && pr.catch) pr.catch(() => {});
+                    }
+                } catch (e3) {}
+                if (callState.active && callState.phase === 'active') startCallKeepAlive();
                 const bad = !!(e && e.name === 'InvalidStateError');
                 toast(bad ? '音频引擎异常，请重试' : '录音初始化失败');
                 const tipEl = document.getElementById('wxCallTip');
@@ -31824,6 +31852,9 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
                 // 延迟 120ms：track.stop() 是同步的，但系统切换会话是异步的，
                 // 立刻播 200ms 静音会被旧的 playAndRecord 会话吞掉。
                 kickPlaybackSession(120);
+                // 申请麦克风时保活节点被停掉了（见 yieldAudioForMic），这里接回来：
+                // 不接的话这通电话后半段只能靠"下次播 TTS 顺手 resume"续命，稳定性全看运气。
+                if (callState.active && callState.phase === 'active') startCallKeepAlive();
                 const mime = (callState.recorder && callState.recorder.mimeType) || callState.actualMime || '';
                 const blob = new Blob(callState.chunks, { type: mime });
 
@@ -31887,6 +31918,8 @@ ${ev.type === 'period' ? '经期话题要克制：不要追问细节，不要开
             resumeCallAudio();
             // 见 finishCallRecord：会话切换是异步的，延迟一点再踢一次
             kickPlaybackSession(120);
+            // 同上：保活节点在申请麦克风时被停掉，取消这条路也要接回来
+            if (callState.active && callState.phase === 'active') startCallKeepAlive();
 
             callState.stream = null;
             callState.recorder = null;
